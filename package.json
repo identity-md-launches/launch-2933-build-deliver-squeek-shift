@@ -1,0 +1,19 @@
+{
+  "name": "squeek-shift",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Squeek Shift: a hamster platform arcade driven by the live Squeekchain wheel.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vite": "^6.4.5",
+    "vitest": "^3.2.7"
+  }
+}

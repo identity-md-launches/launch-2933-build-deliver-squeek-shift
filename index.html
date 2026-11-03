@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Squeek Shift: Tiny hamster. Big adventure.</title>
+    <meta name="description" content="Squeek Shift is a 75-second hamster platform arcade for the Squeekchain community. The live Squeekchain wheel switches the run between a fast day lab and a low-gravity dream. Test coins only." />
+    <meta name="theme-color" content="#f5f7ed" />
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Squeek Shift: Tiny hamster. Big adventure." />
+    <meta property="og:description" content="A 75-second hamster platform run driven by the live Squeekchain wheel. Test coins only, no real payment." />
+    <meta property="og:image" content="./og.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="stylesheet" href="./src/style.css" />
+  </head>
+  <body>
+    <a class="skip" href="#stage">Skip to the game</a>
+    <header class="top">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><use href="#hamster-mark" /></svg>
+        <h1>Squeek Shift</h1>
+      </div>
+      <div class="utils">
+        <button type="button" class="ghost" id="sound-btn" aria-pressed="false">Sound off</button>
+        <button type="button" class="ghost" id="help-btn" aria-haspopup="dialog">Help</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="game card" aria-labelledby="game-title">
+        <div class="intro">
+          <h2 id="game-title" class="tagline">Tiny hamster. Big adventure.</h2>
+          <p class="lede">Jump spikes and grab gold coins for 75 seconds while the real Squeekchain wheel picks the world.</p>
+        </div>
+
+        <ul class="hud" aria-label="Run status">
+          <li><span class="hud-label">Hearts</span> <span id="hud-hearts" class="hearts" aria-label="3 hearts"></span></li>
+          <li><span class="hud-label">Time</span> <span id="hud-time" class="num">75</span></li>
+          <li><span class="hud-label">Score</span> <span id="hud-score" class="num">0</span></li>
+          <li><span class="hud-label">Coins</span> <span id="hud-coins" class="num">0</span></li>
+          <li><span class="hud-label">Level</span> <span id="hud-level" class="num">1/5</span></li>
+        </ul>
+
+        <div id="stage" class="stage" tabindex="-1" aria-label="Game scene. Tap to jump.">
+          <canvas id="canvas" width="960" height="600" aria-hidden="true"></canvas>
+          <p id="world-tag" class="world-tag">Day lab</p>
+          <p id="toast" class="toast" hidden></p>
+        </div>
+
+        <div id="panel" class="panel">
+          <!-- READY -->
+          <div data-view="ready" class="view">
+            <div class="mode" role="radiogroup" aria-label="Run mode">
+              <button type="button" role="radio" class="seg" id="mode-live" aria-checked="true">Live wheel</button>
+              <button type="button" role="radio" class="seg" id="mode-practice" aria-checked="false">Practice · simulated</button>
+            </div>
+            <p id="ready-note" class="note" aria-live="polite"></p>
+            <div class="actions">
+              <button type="button" class="primary" id="primary-btn">Start run · 1,000 coins</button>
+            </div>
+          </div>
+          <!-- RUNNING -->
+          <div data-view="running" class="view" hidden>
+            <div class="actions run-actions">
+              <button type="button" class="jump" id="jump-btn">Jump</button>
+              <button type="button" class="secondary" id="pause-btn">Pause</button>
+            </div>
+            <p class="note">Space, Up or W jumps. Press again in the air to double-jump. P pauses.</p>
+          </div>
+          <!-- PAUSED -->
+          <div data-view="paused" class="view" hidden>
+            <h3 id="pause-title" class="view-title">Paused</h3>
+            <p id="pause-note" class="note"></p>
+            <div class="actions">
+              <button type="button" class="primary" id="resume-btn">Resume</button>
+              <button type="button" class="secondary" id="transfer-btn" hidden>Switch to practice</button>
+            </div>
+          </div>
+          <!-- RESULTS -->
+          <div data-view="results" class="view" hidden>
+            <h3 id="results-title" class="view-title">Run complete</h3>
+            <dl class="results">
+              <div><dt>Score</dt><dd id="r-score" class="num">0</dd></div>
+              <div><dt>Coins earned</dt><dd id="r-earned" class="num">0</dd></div>
+              <div><dt>Entry cost</dt><dd id="r-cost" class="num">1,000</dd></div>
+              <div><dt>New balance</dt><dd id="r-balance" class="num">0</dd></div>
+              <div><dt>Best combo</dt><dd id="r-combo" class="num">0</dd></div>
+              <div><dt>Mode</dt><dd id="r-mode">Live</dd></div>
+            </dl>
+            <div class="actions">
+              <button type="button" class="primary" id="again-btn">Play again · 1,000 coins</button>
+              <button type="button" class="secondary" id="back-btn">Change mode</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="side">
+        <section class="card wallet" aria-labelledby="wallet-title">
+          <h2 id="wallet-title" class="card-title">Wallet</h2>
+          <p class="balance"><span id="balance" class="num">0</span> test coins</p>
+          <p class="note" id="storage-note">Stored on this device only.</p>
+          <button type="button" class="secondary" id="shop-btn" aria-haspopup="dialog">Coin shop</button>
+        </section>
+
+        <section class="card live" aria-labelledby="live-title">
+          <h2 id="live-title" class="card-title">Squeekchain wheel</h2>
+          <p class="conn"><span id="conn-dot" class="dot" aria-hidden="true"></span><span id="conn-text">Connecting</span></p>
+          <dl class="stats">
+            <div><dt>Wheel</dt><dd id="t-status">Unknown</dd></div>
+            <div><dt>Speed</dt><dd id="t-rpm" class="num">Unknown</dd></div>
+            <div><dt>Settled block</dt><dd id="t-block" class="num">Unknown</dd></div>
+            <div><dt>Progress</dt><dd id="t-progress" class="num">Unknown</dd></div>
+            <div><dt>Measured</dt><dd id="t-age" class="num">Unknown</dd></div>
+          </dl>
+          <div class="progress" aria-hidden="true"><span id="t-bar"></span></div>
+          <p class="note">Source: <a href="https://api.squeekchain.com/v1/status" target="_blank" rel="noopener">official status API</a> (<a href="https://docs.squeekchain.com/developers/api/" target="_blank" rel="noopener">docs</a>), Sepolia data, checked every 15 seconds.</p>
+        </section>
+
+        <section class="card records" aria-labelledby="records-title">
+          <h2 id="records-title" class="card-title">Personal bests</h2>
+          <table>
+            <thead>
+              <tr><th scope="col">Mode</th><th scope="col">Score</th><th scope="col">Coins</th><th scope="col">Combo</th><th scope="col">Runs</th></tr>
+            </thead>
+            <tbody>
+              <tr><th scope="row">Live</th><td id="b-live-score" class="num">0</td><td id="b-live-coins" class="num">0</td><td id="b-live-combo" class="num">0</td><td id="b-live-runs" class="num">0</td></tr>
+              <tr><th scope="row">Practice</th><td id="b-practice-score" class="num">0</td><td id="b-practice-coins" class="num">0</td><td id="b-practice-combo" class="num">0</td><td id="b-practice-runs" class="num">0</td></tr>
+            </tbody>
+          </table>
+          <p class="note">Records are stored on this device. There is no global ranking.</p>
+        </section>
+      </aside>
+    </main>
+
+    <footer class="foot">
+      <p>Test coins only. No real payment, no redemption, no rewards. A page reload or closed tab forfeits a run in progress: its entry stays spent and its unfinished coins are not credited.</p>
+    </footer>
+
+    <dialog id="shop" aria-labelledby="shop-title">
+      <form method="dialog" class="dialog-body">
+        <h2 id="shop-title" class="card-title">Coin shop</h2>
+        <p class="warn">Test coins only. No real payment.</p>
+        <p class="note" id="shop-note">Each run costs 1,000 test coins. Pick a pack to add it to this device.</p>
+        <ul class="packs">
+          <li><span class="num">5,000</span> test coins <button type="button" class="secondary" data-pack="5000">Simulate purchase</button></li>
+          <li><span class="num">15,000</span> test coins <button type="button" class="secondary" data-pack="15000">Simulate purchase</button></li>
+          <li><span class="num">50,000</span> test coins <button type="button" class="secondary" data-pack="50000">Simulate purchase</button></li>
+        </ul>
+        <p class="note" id="shop-status" aria-live="polite"></p>
+        <button class="primary" value="close">Close</button>
+      </form>
+    </dialog>
+
+    <dialog id="help" aria-labelledby="help-title">
+      <form method="dialog" class="dialog-body">
+        <h2 id="help-title" class="card-title">How to play</h2>
+        <ul class="help-list">
+          <li>Space, Up or W jumps. Press again in the air for a double jump. On a phone, tap the scene or the Jump button.</li>
+          <li>Orange spikes, crates and dream orbs cost a heart. You get 1.8 seconds of safety after a hit.</li>
+          <li>Each gold coin adds 100 test coins. Grab coins in a row to build a score combo.</li>
+          <li>A run lasts 75 seconds or three hearts. It speeds up every 15 seconds, five levels in all.</li>
+          <li>Live mode follows the real wheel: running means a fast day lab, resting means a floaty dream. A newly settled block gives a short coin magnet.</li>
+          <li>If the live signal drops, the run pauses. Resume once a fresh reading arrives, or switch to practice: the live entry is refunded, its unfinished coins are dropped, and one practice entry is charged, so switching costs nothing extra.</li>
+          <li>Practice · simulated works offline and swaps day and dream every 20 seconds. Its records are kept apart.</li>
+        </ul>
+        <button class="primary" value="close">Got it</button>
+      </form>
+    </dialog>
+
+    <p id="announcer" class="sr-only" aria-live="polite"></p>
+
+    <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+      <symbol id="hamster-mark" viewBox="0 0 64 64">
+        <circle cx="32" cy="32" r="30" fill="#d0e87b" />
+        <circle cx="22" cy="18" r="6" fill="#e9a65b" /><circle cx="40" cy="17" r="6" fill="#e9a65b" />
+        <ellipse cx="32" cy="36" rx="20" ry="16" fill="#e9a65b" />
+        <ellipse cx="36" cy="40" rx="12" ry="9" fill="#fbe3c0" />
+        <circle cx="42" cy="31" r="3" fill="#253c30" /><circle cx="51" cy="35" r="2.5" fill="#d4706b" />
+      </symbol>
+      <symbol id="heart" viewBox="0 0 24 24">
+        <path d="M12 21s-7.5-4.6-9.6-9.2C.9 8.4 3 4.5 6.7 4.5c2.2 0 3.6 1.2 5.3 3.1 1.7-1.9 3.1-3.1 5.3-3.1 3.7 0 5.8 3.9 4.3 7.3C19.5 16.4 12 21 12 21z" />
+      </symbol>
+    </svg>
+
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>
