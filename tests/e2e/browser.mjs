@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const pwPath = process.env.IMD_PLAYWRIGHT;
-const { chromium } = pwPath ? await import(pwPath) : await import('playwright');
+const { chromium, webkit } = pwPath ? await import(pwPath) : await import('playwright');
 const root = path.resolve('dist');
 const shotDir = process.env.SHOTS || '';
 
@@ -32,7 +32,7 @@ const body = () => {
   const now = new Date().toISOString();
   return {
     schemaVersion: 1,
-    measurement: { freshness: 'online', observedAt: now, receivedAt: now, staleAfterSeconds: 120, provenance: 'hardware', coreStatus: api.core, rpmMilli: api.core === 'ACTIVE' ? 64000 : 0 },
+    measurement: { freshness: 'online', observedAt: now, receivedAt: now, staleAfterSeconds: 120, provenance: 'hardware', coreStatus: api.core, rpmMilli: api.core === 'ACTIVE' ? 64000 : 0, ...api.measurement },
     builder: { status: 'available', anchor: { blockHeight: api.height, blockProgress: '500000000' } },
     oracle: { state: 'accepted' },
   };
@@ -44,9 +44,10 @@ const check = (name, ok, detail = '') => {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `  (${detail})` : ''}`);
 };
 
-const browser = await chromium.launch();
+const browser = await (process.env.BROWSER === 'webkit' ? webkit : chromium).launch();
 async function open(viewport, opts = {}) {
-  const ctx = await browser.newContext({ viewport, hasTouch: !!opts.touch, isMobile: !!opts.touch });
+  const ctx = await browser.newContext({ viewport, hasTouch: !!opts.touch, isMobile: !!opts.touch, reducedMotion: opts.reducedMotion || 'no-preference' });
+  if (opts.init) await ctx.addInitScript(opts.init);
   const page = await ctx.newPage();
   const errors = [];
   page.on('pageerror', (e) => errors.push(String(e)));
@@ -54,7 +55,7 @@ async function open(viewport, opts = {}) {
   // simulated outage, not an app error. Everything else counts.
   page.on('console', (m) => m.type() === 'error' && !(api.kind === 'offline' && m.text().includes('net::ERR_FAILED')) && errors.push(m.text()));
   page.on('requestfailed', (r) => !r.url().startsWith('https://api.squeekchain.com/') && errors.push(`request failed ${r.url()}`));
-  await page.route('https://api.squeekchain.com/**', (route) => {
+  await ctx.route('https://api.squeekchain.com/**', (route) => {
     if (api.kind === 'offline') return route.abort('failed');
     return route.fulfill({ status: 200, contentType: 'application/json', headers: { 'access-control-allow-origin': '*' }, body: JSON.stringify(body()) });
   });
@@ -64,7 +65,7 @@ async function open(viewport, opts = {}) {
 }
 const st = (page) => page.evaluate(() => {
   const s = window.__squeek.state();
-  return { view: s.view, mode: s.mode, pause: s.pauseReason, signal: s.signal, balance: s.ledger.balance, claimed: s.ledger.claimed, bests: s.ledger.bests, runs: s.ledger.runs, e: s.engine && { py: s.engine.py, jumps: s.engine.jumpsUsed, world: s.engine.world, time: s.engine.time, magnet: s.engine.magnet, finished: s.engine.finished, coins: s.engine.coins, bestCombo: s.engine.bestCombo } };
+  return { view: s.view, mode: s.mode, pause: s.pauseReason, signal: s.signal, balance: s.ledger.balance, claimed: s.ledger.claimed, bests: s.ledger.bests, runs: s.ledger.runs, e: s.engine && { py: s.engine.py, jumps: s.engine.jumpsUsed, world: s.engine.world, time: s.engine.time, hearts: s.engine.hearts, magnet: s.engine.magnet, finished: s.engine.finished, coins: s.engine.coins, bestCombo: s.engine.bestCombo } };
 });
 const poll = (page) => page.evaluate(() => window.__squeek.poller.poll());
 const overflow = (page) => page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
@@ -152,7 +153,10 @@ const overflow = (page) => page.evaluate(() => document.documentElement.scrollWi
   api.height = '101';
   await poll(page);
   s = await st(page);
-  check('rollback then recovery: bonus only from rising consecutive reads', s.e.magnet > 0, 'rollback reset baseline, then rise');
+  check('rollback then recovery never rewards the same settled block twice', s.e.magnet === 0);
+  api.height = '102';
+  await poll(page);
+  check('a new high-water mark still earns a magnet', (await st(page)).e.magnet > 0);
 
   // stall > 250ms pauses
   await page.evaluate(() => {
@@ -289,6 +293,226 @@ const overflow = (page) => page.evaluate(() => document.documentElement.scrollWi
   check('offline: wheel never shown as resting', (await page.locator('#world-tag').textContent()) === 'Wheel state unknown');
   if (shotDir) await page.screenshot({ path: `${shotDir}/320-offline.png`, fullPage: true });
   check('320: no uncaught errors', errors.length === 0, errors.join(' | '));
+  await ctx.close();
+}
+
+// ---- Revision regressions: storage denial after a successful boot ----
+const denyLedgerWrites = (page) => page.evaluate(() => {
+  const original = Storage.prototype.setItem;
+  Storage.prototype.setItem = function (key, value) {
+    if (key === 'squeek-shift:ledger:v1') throw new DOMException('Quota exceeded', 'QuotaExceededError');
+    return original.call(this, key, value);
+  };
+});
+const claimAndWait = async (page) => {
+  await page.locator('#primary-btn').click();
+  await page.waitForTimeout(900);
+};
+const completeWithThreeCoins = async (page) => {
+  if ((await st(page)).view === 'paused') await page.locator('#resume-btn').click();
+  await page.evaluate(() => {
+    const e = window.__squeek.state().engine;
+    e.time = 74.98;
+    e.coins = 3;
+    e.bestCombo = 3;
+  });
+  await page.waitForFunction(() => window.__squeek.state().view === 'results');
+};
+
+for (const phase of ['claim', 'entry', 'reward', 'transfer']) {
+  api = { kind: 'ok', core: 'ACTIVE', height: '100' };
+  const { page, ctx, errors } = await open({ width: 390, height: 844 }, { touch: true });
+  if (phase === 'claim') await denyLedgerWrites(page);
+  await claimAndWait(page);
+  check(`${phase} write failure: free claim retained`, (await st(page)).balance === 5000 && (await st(page)).claimed);
+  if (phase === 'entry') await denyLedgerWrites(page);
+  if (phase !== 'transfer') await page.locator('#mode-practice').click();
+  await page.locator('#primary-btn').click();
+  await page.keyboard.press('KeyP');
+  if (phase === 'reward' || phase === 'transfer') await denyLedgerWrites(page);
+  if (phase === 'transfer') {
+    api.kind = 'unavailable';
+    await poll(page);
+    await page.locator('#transfer-btn').click();
+    const s = await st(page);
+    check('late write failure: transfer refund/debit retained, net zero', s.balance === 4000 && s.mode === 'practice' && Object.values(s.runs).filter((r) => r.status === 'refunded').length === 1);
+  } else {
+    const s = await st(page);
+    check(`${phase} write failure: active debit retained`, s.balance === 4000 && Object.values(s.runs).some((r) => r.status === 'active'));
+  }
+  await completeWithThreeCoins(page);
+  let s = await st(page);
+  check(`${phase} write failure: reward and best combo retained`, s.balance === 4300 && s.bests.practice.runs === 1 && s.bests.practice.combo === 3);
+  check(`${phase} write failure: honest tab-only storage notice`, /last only while this tab is open/.test(await page.locator('#storage-note').textContent()));
+  await page.waitForTimeout(100);
+  check(`${phase} write failure: no repeated reward`, (await st(page)).balance === 4300);
+  if (phase === 'claim') {
+    await page.locator('#shop-btn').click();
+    await page.locator('[data-pack="5000"]').dblclick();
+    s = await st(page);
+    check('memory fallback: simulated pack credited once', s.balance === 9300);
+    await page.locator('#shop button[value="close"]').click();
+    await page.evaluate(() => window.dispatchEvent(new StorageEvent('storage')));
+    check('memory fallback: storage event cannot restore an older balance', (await st(page)).balance === 9300);
+  }
+  check(`${phase} write failure: no uncaught errors`, errors.length === 0, errors.join(' | '));
+  await ctx.close();
+}
+
+// ---- Another tab is not abandonment; reload only forfeits its own paid entry ----
+{
+  api = { kind: 'ok', core: 'ACTIVE', height: '100' };
+  const { page, ctx, errors } = await open({ width: 390, height: 844 }, { touch: true });
+  await claimAndWait(page);
+  await page.locator('#mode-practice').click();
+  await page.locator('#primary-btn').click();
+  await page.keyboard.press('KeyP');
+  const firstId = Object.values((await st(page)).runs).find((r) => r.status === 'active').id;
+  const other = await ctx.newPage();
+  await other.goto(base);
+  await other.waitForFunction(() => window.__squeek);
+  check('new tab leaves original paused run active', (await st(page)).runs[firstId].status === 'active');
+  await other.close();
+  await page.bringToFront();
+  check('closing other tab leaves original run active', (await st(page)).runs[firstId].status === 'active');
+  await completeWithThreeCoins(page);
+  let s = await st(page);
+  check('original tab credits 300 exactly once after second tab closes', s.balance === 4300 && s.runs[firstId].credited === 300 && s.runs[firstId].status === 'finished');
+  check('original tab saves authoritative combo and record', s.bests.practice.runs === 1 && s.bests.practice.combo === 3);
+
+  await page.locator('#again-btn').click();
+  await page.keyboard.press('KeyP');
+  const activeId = Object.values((await st(page)).runs).find((r) => r.status === 'active').id;
+  const another = await ctx.newPage();
+  await another.goto(base);
+  await another.waitForFunction(() => window.__squeek?.state().signal === 'ready');
+  await another.locator('#mode-practice').click();
+  await another.locator('#primary-btn').click();
+  await another.keyboard.press('KeyP');
+  s = await st(another);
+  const otherRun = Object.values(s.runs).find((r) => r.status === 'active' && r.id !== activeId);
+  check('each open page has a distinct run owner', otherRun.ownerId !== s.runs[activeId].ownerId);
+  await another.reload();
+  await another.waitForFunction(() => window.__squeek);
+  s = await st(another);
+  check('reload abandons only that page’s active run', s.runs[otherRun.id].status === 'abandoned' && s.runs[activeId].status === 'active');
+  await another.close();
+  await page.bringToFront();
+  await completeWithThreeCoins(page);
+  s = await st(page);
+  check('surviving page still finishes and credits once', s.balance === 2600 && s.bests.practice.runs === 2 && s.runs[activeId].credited === 300, `balance ${s.balance}`);
+  check('multi-tab flow: no uncaught errors', errors.length === 0, errors.join(' | '));
+  await ctx.close();
+}
+
+// ---- A refused finish is displayed honestly ----
+{
+  api = { kind: 'ok', core: 'ACTIVE', height: '100' };
+  const { page, ctx, errors } = await open({ width: 390, height: 844 });
+  await claimAndWait(page);
+  await page.locator('#mode-practice').click();
+  await page.locator('#primary-btn').click();
+  await page.keyboard.press('KeyP');
+  await page.evaluate(() => {
+    const key = 'squeek-shift:ledger:v1';
+    const d = JSON.parse(localStorage.getItem(key));
+    for (const r of Object.values(d.runs)) r.status = 'abandoned';
+    localStorage.setItem(key, JSON.stringify(d));
+  });
+  await completeWithThreeCoins(page);
+  const s = await st(page);
+  check('refused finish: does not invent credits or records', s.balance === 4000 && s.bests.practice.runs === 0);
+  check('refused finish: visible error explains that coins and records were not added', await page.locator('#result-note').isVisible() && /No coins or personal bests were added/.test(await page.locator('#result-note').textContent()));
+  check('refused finish: earned amount is labelled as not credited', (await page.locator('#r-earned-label').textContent()) === 'Coins not credited');
+  check('refused finish: no uncaught errors', errors.length === 0, errors.join(' | '));
+  await ctx.close();
+}
+
+// ---- Incomplete or future measurements must pause live play ----
+{
+  api = { kind: 'ok', core: 'ACTIVE', height: '100' };
+  const { page, ctx, errors } = await open({ width: 390, height: 844 });
+  await page.waitForFunction(() => window.__squeek?.state().signal === 'ready');
+  await claimAndWait(page);
+  await page.locator('#primary-btn').click();
+  const cases = [
+    ['missing observedAt', { observedAt: undefined }],
+    ['invalid observedAt', { observedAt: 'invalid' }],
+    ['missing receivedAt', { receivedAt: undefined }],
+    ['invalid receivedAt', { receivedAt: 'invalid' }],
+    ['missing staleAfterSeconds', { staleAfterSeconds: undefined }],
+    ['wrong staleAfterSeconds for schema v1', { staleAfterSeconds: 121 }],
+    ['future observedAt', { observedAt: '2099-01-01T00:00:00.000Z' }],
+    ['future receivedAt', { receivedAt: '2099-01-01T00:00:00.000Z' }],
+    ['both future timestamps', { observedAt: '2099-01-01T00:00:00.000Z', receivedAt: '2099-01-01T00:00:00.000Z' }],
+  ];
+  for (const [name, measurement] of cases) {
+    api.measurement = measurement;
+    await poll(page);
+    const s = await st(page);
+    check(`${name}: invalid and paused, no extra debit`, s.signal === 'invalid' && s.view === 'paused' && s.balance === 4000);
+    check(`${name}: last validated measurement shown as history`, (await page.locator('#t-status').textContent()).startsWith('Last:') && /historical/.test(await page.locator('#t-age').textContent()));
+    check(`${name}: resume disabled`, await page.locator('#resume-btn').isDisabled());
+    api.measurement = undefined;
+    await poll(page);
+    check(`${name}: fresh response waits for player`, (await st(page)).view === 'paused');
+    await page.locator('#resume-btn').click();
+  }
+  check('invalid telemetry flow: no uncaught errors', errors.length === 0, errors.join(' | '));
+  await ctx.close();
+}
+
+// ---- A modal cannot consume an undefendable paid run ----
+{
+  api = { kind: 'ok', core: 'ACTIVE', height: '100' };
+  const { page, ctx, errors } = await open({ width: 1440, height: 900 });
+  await claimAndWait(page);
+  await page.locator('#mode-practice').click();
+  await page.locator('#primary-btn').click();
+  await page.locator('#shop-btn').click();
+  const before = await st(page);
+  await page.waitForTimeout(5000);
+  let s = await st(page);
+  check('shop pauses active gameplay and preserves time and hearts for five seconds', s.view === 'paused' && s.e.time === before.e.time && s.e.hearts === before.e.hearts && s.balance === 4000);
+  await page.keyboard.press('Space');
+  await page.keyboard.press('KeyP');
+  check('keys inside the shop cannot resume gameplay', (await st(page)).view === 'paused');
+  check('Space inside the shop keeps native purchase-button activation', (await st(page)).balance === 9000);
+  await page.locator('#shop button[value="close"]').click();
+  check('closing shop leaves run paused', (await st(page)).view === 'paused');
+  const shopBalance = (await st(page)).balance;
+  await page.locator('#resume-btn').click();
+  await page.waitForTimeout(100);
+  s = await st(page);
+  check('explicit resume after shop advances time without debit', s.view === 'running' && s.e.time > before.e.time && s.balance === shopBalance);
+  check('shop pause flow: no uncaught errors', errors.length === 0, errors.join(' | '));
+  await ctx.close();
+}
+
+// ---- Reduced motion must cover the canvas, not only CSS animations ----
+{
+  api = { kind: 'ok', core: 'ACTIVE', height: '100' };
+  const { page, ctx, errors } = await open({ width: 390, height: 844 }, { reducedMotion: 'reduce' });
+  await page.waitForFunction(() => window.__squeek?.state().signal === 'ready');
+  const scene = () => page.locator('#canvas').evaluate((c) => c.toDataURL());
+  await page.waitForTimeout(100);
+  const first = await scene();
+  await page.waitForTimeout(1100);
+  check('reduced motion: idle day canvas is pixel-identical after one second', first === await scene());
+  api.core = 'IDLE';
+  await poll(page);
+  await page.waitForTimeout(100);
+  const dream = await scene();
+  await page.waitForTimeout(1100);
+  check('reduced motion: idle dream canvas is pixel-identical after one second', dream === await scene());
+  await claimAndWait(page);
+  await page.locator('#primary-btn').click();
+  const start = await st(page);
+  await page.waitForTimeout(100);
+  const active = await scene();
+  await page.waitForTimeout(100);
+  check('reduced motion: deliberate Start enables gameplay movement', active !== await scene() && (await st(page)).e.time > start.e.time);
+  check('reduced motion flow: no uncaught errors', errors.length === 0, errors.join(' | '));
   await ctx.close();
 }
 

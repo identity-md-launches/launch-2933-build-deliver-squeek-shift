@@ -5,6 +5,9 @@ export const STATUS_URL = 'https://api.squeekchain.com/v1/status';
 export const DOCS_URL = 'https://docs.squeekchain.com/developers/api/';
 export const POLL_MS = 15_000;
 export const TIMEOUT_MS = 8_000;
+// v1's published measurement schema fixes this value at 120 seconds.
+export const STALE_AFTER_SECONDS = 120;
+export const CLOCK_SKEW_MS = 5_000;
 
 export type CoreStatus = 'ACTIVE' | 'IDLE' | 'COUNTER_FAULT';
 
@@ -24,7 +27,7 @@ export interface Reading {
   receivedAt: string | null;
   freshness: string | null;
   provenance: string | null;
-  staleAfterSeconds: number;
+  staleAfterSeconds: number | null;
   oracleState: string | null;
   /** Settled anchor height as a decimal string (parsed with BigInt). */
   blockHeight: string | null;
@@ -42,10 +45,23 @@ export interface Snapshot {
 const isDec = (v: unknown): v is string => typeof v === 'string' && /^\d{1,30}$/.test(v);
 const isInt = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v);
 
+/** RFC 3339 date-time, including a real calendar date and explicit timezone. */
+function timestamp(v: unknown): number | null {
+  if (typeof v !== 'string') return null;
+  const parts = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/i.exec(v);
+  if (!parts) return null;
+  const [year, month, day, hour, minute, second] = parts.slice(1, 7).map(Number);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (month < 1 || month > 12 || day < 1 || day > days[month - 1] || hour > 23 || minute > 59 || second > 59) return null;
+  const time = Date.parse(v);
+  return Number.isFinite(time) ? time : null;
+}
+
 export function measurementAgeSeconds(r: Reading | null, now: number): number | null {
   if (!r) return null;
-  const t = Date.parse(r.receivedAt ?? r.observedAt ?? '');
-  if (!Number.isFinite(t)) return null;
+  const t = timestamp(r.receivedAt);
+  if (t === null || t > now + CLOCK_SKEW_MS) return null;
   return Math.max(0, (now - t) / 1000);
 }
 
@@ -71,7 +87,7 @@ export function parseStatus(body: unknown, now: number): Snapshot {
     receivedAt: typeof m.receivedAt === 'string' ? m.receivedAt : null,
     freshness: typeof m.freshness === 'string' ? m.freshness : null,
     provenance: typeof m.provenance === 'string' ? m.provenance : null,
-    staleAfterSeconds: isInt(m.staleAfterSeconds) && m.staleAfterSeconds > 0 ? m.staleAfterSeconds : 120,
+    staleAfterSeconds: isInt(m.staleAfterSeconds) ? m.staleAfterSeconds : null,
     oracleState: oracle && typeof oracle.state === 'string' ? oracle.state : null,
     blockHeight: anchor && isDec(anchor.blockHeight) ? anchor.blockHeight : null,
     blockProgress: anchor && isDec(anchor.blockProgress) ? Math.min(1, Number(anchor.blockProgress) / 1e9) : null,
@@ -79,7 +95,11 @@ export function parseStatus(body: unknown, now: number): Snapshot {
 
   if (coreStatus === null) return fail('invalid', `Unknown wheel status ${String(core)}`, reading);
   if (coreStatus === 'COUNTER_FAULT') return fail('fault', 'Wheel counter fault reported', reading);
-  if (!reading.receivedAt || !Number.isFinite(Date.parse(reading.receivedAt))) return fail('invalid', 'Missing measurement time', reading);
+  const observed = timestamp(reading.observedAt);
+  const received = timestamp(reading.receivedAt);
+  if (observed === null || received === null) return fail('invalid', 'Missing or invalid measurement time', reading);
+  if (reading.staleAfterSeconds !== STALE_AFTER_SECONDS) return fail('invalid', 'Invalid measurement staleAfterSeconds for schema v1', reading);
+  if (observed > now + CLOCK_SKEW_MS || received > now + CLOCK_SKEW_MS) return fail('invalid', 'Measurement time is in the future', reading);
   const age = measurementAgeSeconds(reading, now) ?? Infinity;
   if (reading.freshness !== 'online' || age > reading.staleAfterSeconds) return fail('stale', 'Wheel reading is stale', reading);
   if (reading.provenance !== 'hardware') return fail('unvalidated', `Reading provenance is ${reading.provenance ?? 'missing'}, not hardware`, reading);
@@ -93,7 +113,8 @@ export function currentState(s: Snapshot | null, now: number): SignalState {
   if (!s) return 'offline';
   if (s.state !== 'ready') return s.state;
   const age = measurementAgeSeconds(s.reading, now);
-  if (age === null || age > (s.reading?.staleAfterSeconds ?? 120)) return 'stale';
+  if (s.reading?.staleAfterSeconds !== STALE_AFTER_SECONDS || age === null) return 'invalid';
+  if (age > s.reading.staleAfterSeconds) return 'stale';
   // A ready snapshot older than two poll intervals means polls have been failing silently.
   if (now - s.fetchedAt > POLL_MS * 2 + TIMEOUT_MS) return 'stale';
   return 'ready';
@@ -101,8 +122,8 @@ export function currentState(s: Snapshot | null, now: number): SignalState {
 
 /**
  * Tracks settled block height across consecutive ready polls during one run. A bonus fires
- * only when two back-to-back ready readings show the height rising. Initial load, gaps after
- * a failed poll (reconnect), rollbacks and non-ready data reset the baseline instead.
+ * only for a new high-water mark. A rollback and recovery cannot reward an already seen
+ * block. Initial load and gaps after a failed poll (reconnect) establish a new baseline.
  */
 export class BlockWatcher {
   private baseline: bigint | null = null;
@@ -119,7 +140,7 @@ export class BlockWatcher {
     }
     const h = BigInt(s.reading.blockHeight);
     const prev = this.baseline;
-    this.baseline = h;
+    if (prev === null || h > prev) this.baseline = h;
     if (prev === null) return false;
     return h > prev;
   }
@@ -175,7 +196,7 @@ export class Poller {
     const s = await fetchStatus(this.fetchFn);
     this.inflight = false;
     this.latest = s;
-    if (s.reading) this.lastReading = s.reading;
+    if (s.state === 'ready' && s.reading) this.lastReading = s.reading;
     this.onUpdate(s);
     if (!this.stopped) this.timer = setTimeout(() => void this.poll(), this.intervalMs);
   }

@@ -12,6 +12,8 @@ export type RunStatus = 'active' | 'finished' | 'refunded' | 'abandoned';
 
 export interface RunRecord {
   id: string;
+  /** A new owner for each loaded page; other tabs cannot abandon or finish this run. */
+  ownerId: string | null;
   mode: RunMode;
   status: RunStatus;
   cost: number;
@@ -65,7 +67,7 @@ export function sanitize(raw: unknown): LedgerData {
       const x = v as Record<string, unknown>;
       const status = ['active', 'finished', 'refunded', 'abandoned'].includes(x.status as string) ? (x.status as RunStatus) : 'abandoned';
       const mode: RunMode = x.mode === 'practice' ? 'practice' : 'live';
-      d.runs[id] = { id, mode, status, cost: nat(x.cost), credited: nat(x.credited), startedAt: nat(x.startedAt) };
+      d.runs[id] = { id, ownerId: typeof x.ownerId === 'string' ? x.ownerId : null, mode, status, cost: nat(x.cost), credited: nat(x.credited), startedAt: nat(x.startedAt) };
     }
   }
   const b = r.bests as Record<string, unknown> | undefined;
@@ -86,9 +88,9 @@ export interface OpResult {
 
 export class Ledger {
   private memory: string | null = null;
-  readonly persistent: boolean;
+  private storageAvailable: boolean;
 
-  constructor(private kv: KV | null) {
+  constructor(private kv: KV | null, private readonly ownerId: string = crypto.randomUUID()) {
     let ok = false;
     if (kv) {
       try {
@@ -99,7 +101,11 @@ export class Ledger {
         ok = false;
       }
     }
-    this.persistent = ok;
+    this.storageAvailable = ok;
+  }
+
+  get persistent(): boolean {
+    return this.storageAvailable;
   }
 
   read(): LedgerData {
@@ -107,7 +113,9 @@ export class Ledger {
     if (this.persistent && this.kv) {
       try {
         text = this.kv.get(STORAGE_KEY);
+        this.memory = text;
       } catch {
+        this.storageAvailable = false;
         text = this.memory;
       }
     } else text = this.memory;
@@ -126,7 +134,8 @@ export class Ledger {
       try {
         this.kv.set(STORAGE_KEY, text);
       } catch {
-        /* quota or denial: keep in-memory copy for this tab */
+        // Stay on the current snapshot for this page, even if storage later recovers.
+        this.storageAvailable = false;
       }
     }
   }
@@ -169,7 +178,7 @@ export class Ledger {
       if (d.runs[runId]) return 'duplicate';
       if (d.balance < ENTRY_COST) return 'insufficient';
       d.balance -= ENTRY_COST;
-      d.runs[runId] = { id: runId, mode, status: 'active', cost: ENTRY_COST, credited: 0, startedAt: now };
+      d.runs[runId] = { id: runId, ownerId: this.ownerId, mode, status: 'active', cost: ENTRY_COST, credited: 0, startedAt: now };
       pruneRuns(d);
       return null;
     });
@@ -179,7 +188,7 @@ export class Ledger {
   finishRun(runId: string, result: RunResult): OpResult {
     return this.tx((d) => {
       const run = d.runs[runId];
-      if (!run || run.status !== 'active') return 'not-active';
+      if (!run || run.status !== 'active' || run.ownerId !== this.ownerId) return 'not-active';
       const earned = nat(result.coinsEarned);
       run.status = 'finished';
       run.credited = earned;
@@ -200,24 +209,25 @@ export class Ledger {
   transferToPractice(liveRunId: string, practiceRunId: string, now = Date.now()): OpResult {
     return this.tx((d) => {
       const run = d.runs[liveRunId];
-      if (!run || run.status !== 'active' || run.mode !== 'live') return 'not-active';
+      if (!run || run.status !== 'active' || run.mode !== 'live' || run.ownerId !== this.ownerId) return 'not-active';
       if (d.runs[practiceRunId]) return 'duplicate';
       run.status = 'refunded';
       d.balance += run.cost;
       if (d.balance < ENTRY_COST) return 'insufficient';
       d.balance -= ENTRY_COST;
-      d.runs[practiceRunId] = { id: practiceRunId, mode: 'practice', status: 'active', cost: ENTRY_COST, credited: 0, startedAt: now };
+      d.runs[practiceRunId] = { id: practiceRunId, ownerId: this.ownerId, mode: 'practice', status: 'active', cost: ENTRY_COST, credited: 0, startedAt: now };
       return null;
     });
   }
 
   /**
-   * On page load, any run still active was abandoned (reload, closed tab, crash). Its entry
-   * stays spent and its unfinished earnings are never credited. Returns abandoned count.
+   * On this page's departure, abandon only its own runs. Other open pages retain theirs.
+   * If a crash prevents departure cleanup, the new page has a different owner and cannot
+   * finish or refund the orphaned run. Its entry stays spent; earnings are never credited.
    */
-  abandonActive(exceptRunId?: string): OpResult {
+  abandonActive(): OpResult {
     return this.tx((d) => {
-      for (const r of Object.values(d.runs)) if (r.status === 'active' && r.id !== exceptRunId) r.status = 'abandoned';
+      for (const r of Object.values(d.runs)) if (r.status === 'active' && r.ownerId === this.ownerId) r.status = 'abandoned';
       return null;
     });
   }

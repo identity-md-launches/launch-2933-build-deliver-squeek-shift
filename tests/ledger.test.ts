@@ -103,11 +103,41 @@ describe('ledger', () => {
     const a = new Ledger(kv);
     a.claim();
     a.startRun('r1', 'live');
+    a.abandonActive(); // this page's non-cached pagehide, before the reload
     const b = new Ledger(kv);
     b.abandonActive();
     expect(b.read().runs.r1.status).toBe('abandoned');
     expect(a.finishRun('r1', result(10)).ok).toBe(false);
     expect(b.read().balance).toBe(FREE_CLAIM - ENTRY_COST);
+  });
+
+  it('opening and closing another page preserves the first page’s run and earnings', () => {
+    const kv = memKV();
+    const a = new Ledger(kv, 'page-a');
+    a.claim();
+    a.startRun('r1', 'practice');
+    const b = new Ledger(kv, 'page-b');
+    b.startRun('r2', 'live');
+    expect(b.finishRun('r1', result(3)).error).toBe('not-active');
+    expect(b.transferToPractice('r1', 'wrong-owner').error).toBe('not-active');
+    b.abandonActive();
+    expect(a.read().runs.r1.status).toBe('active');
+    expect(a.read().runs.r2.status).toBe('abandoned');
+    expect(a.finishRun('r1', result(3, 73, 3)).ok).toBe(true);
+    expect(a.finishRun('r1', result(3)).error).toBe('not-active');
+    expect(a.read().balance).toBe(3300);
+    expect(a.read().bests.practice).toEqual({ score: 73, coins: 300, combo: 3, runs: 1 });
+  });
+
+  it('a new page cannot credit or refund a crashed page’s unfinished run', () => {
+    const kv = memKV();
+    const a = new Ledger(kv, 'crashed-page');
+    a.claim();
+    a.startRun('orphan', 'live'); // no pagehide cleanup after a crash
+    const b = new Ledger(kv, 'new-page');
+    expect(b.finishRun('orphan', result(10)).error).toBe('not-active');
+    expect(b.transferToPractice('orphan', 'bypass').error).toBe('not-active');
+    expect(b.read().balance).toBe(4000);
   });
 
   it('treats corrupted storage as untrusted: never negative or NaN', () => {
@@ -138,5 +168,55 @@ describe('ledger', () => {
     expect(l.claim().ok).toBe(true);
     expect(l.read().balance).toBe(FREE_CLAIM);
     expect(new Ledger(null).persistent).toBe(false);
+  });
+
+  for (const phase of ['claim', 'entry', 'reward', 'transfer'] as const) {
+    it(`retains the current snapshot when storage starts failing at ${phase}`, () => {
+      const kv = memKV();
+      let denied = false;
+      const l = new Ledger({ get: kv.get, set: (k, v) => {
+        if (denied && k === STORAGE_KEY) throw new Error('QuotaExceededError');
+        kv.set(k, v);
+      } });
+      expect(l.persistent).toBe(true);
+      if (phase !== 'claim') l.claim();
+      if (phase === 'reward' || phase === 'transfer') l.startRun('r1', 'live');
+      denied = true;
+      if (phase === 'claim') expect(l.claim().ok).toBe(true);
+      if (phase === 'entry') expect(l.startRun('r1', 'live').ok).toBe(true);
+      if (phase === 'reward') expect(l.finishRun('r1', result(3)).ok).toBe(true);
+      if (phase === 'transfer') expect(l.transferToPractice('r1', 'p1').ok).toBe(true);
+      expect(l.persistent).toBe(false);
+      expect(l.read().balance).toBe(phase === 'claim' ? 5000 : phase === 'reward' ? 4300 : 4000);
+      expect(l.claim().error).toBe('already-claimed');
+      if (phase === 'entry') expect(l.startRun('r1', 'live').error).toBe('duplicate');
+      if (phase === 'reward') expect(l.finishRun('r1', result(3)).error).toBe('not-active');
+      if (phase === 'transfer') expect(l.transferToPractice('r1', 'p2').error).toBe('not-active');
+      // A storage recovery or another tab's stale snapshot must not overwrite this page.
+      denied = false;
+      kv.set(STORAGE_KEY, JSON.stringify({ balance: 0, claimed: false }));
+      expect(l.simulatePurchase(5000, 'pack').ok).toBe(true);
+      expect(l.simulatePurchase(5000, 'pack').error).toBe('duplicate');
+      expect(l.read().balance).toBe(phase === 'claim' ? 10000 : phase === 'reward' ? 9300 : 9000);
+      expect(l.read().claimed).toBe(true);
+      if (phase === 'reward') expect(l.read().bests.live.combo).toBe(4);
+    });
+  }
+
+  it('uses its latest read snapshot if storage reads later become denied', () => {
+    const kv = memKV();
+    let denied = false;
+    const l = new Ledger({ set: kv.set, get: (k) => {
+      if (denied) throw new Error('SecurityError');
+      return kv.get(k);
+    } });
+    l.claim();
+    l.startRun('r1', 'practice');
+    expect(l.read().balance).toBe(4000);
+    denied = true;
+    expect(l.read().balance).toBe(4000);
+    expect(l.persistent).toBe(false);
+    expect(l.finishRun('r1', result(3)).ok).toBe(true);
+    expect(l.read().balance).toBe(4300);
   });
 });

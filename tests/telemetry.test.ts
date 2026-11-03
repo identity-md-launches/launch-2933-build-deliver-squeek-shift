@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { BlockWatcher, Poller, currentState, fetchStatus, parseStatus, type FetchFn } from '../src/telemetry';
+import { BlockWatcher, CLOCK_SKEW_MS, Poller, currentState, fetchStatus, measurementAgeSeconds, parseStatus, type FetchFn } from '../src/telemetry';
 
 const NOW = Date.parse('2026-11-03T19:46:40.000Z');
 
@@ -66,6 +66,25 @@ describe('parseStatus (schemaVersion 1)', () => {
     expect(currentState(s, NOW + 125_000)).toBe('stale');
     expect(currentState(null, NOW)).toBe('offline');
   });
+
+  for (const field of ['observedAt', 'receivedAt']) {
+    it.each([undefined, null, 'invalid', '2026-11-03', '2026-02-30T19:46:35Z', '2026-11-03T25:00:00Z'])(`rejects ${field} = %s`, (value) => {
+      expect(parseStatus(sample({}, { [field]: value }), NOW).state).toBe('invalid');
+    });
+    it(`rejects future ${field} beyond a five-second clock tolerance`, () => {
+      expect(parseStatus(sample({}, { [field]: new Date(NOW + CLOCK_SKEW_MS).toISOString() }), NOW).state).toBe('ready');
+      expect(parseStatus(sample({}, { [field]: new Date(NOW + CLOCK_SKEW_MS + 1).toISOString() }), NOW).state).toBe('invalid');
+      expect(parseStatus(sample({}, { [field]: '2099-01-01T00:00:00.000Z' }), NOW).state).toBe('invalid');
+    });
+  }
+  it.each([undefined, null, 0, -1, 1, 121, 120.5, '120', NaN, Infinity])('requires schema-v1 staleAfterSeconds, rejecting %s', (value) => {
+    expect(parseStatus(sample({}, { staleAfterSeconds: value }), NOW).state).toBe('invalid');
+  });
+  it('never presents a far-future receivedAt as measured zero seconds ago', () => {
+    const s = parseStatus(sample({}, { observedAt: '2099-01-01T00:00:00.000Z', receivedAt: '2099-01-01T00:00:00.000Z' }), NOW);
+    expect(s.state).toBe('invalid');
+    expect(measurementAgeSeconds(s.reading, NOW)).toBeNull();
+  });
 });
 
 describe('BlockWatcher magnet bonus', () => {
@@ -86,6 +105,11 @@ describe('BlockWatcher magnet bonus', () => {
     expect(w.observe(parseStatus(sample({}, { freshness: 'stale' }, { blockHeight: '201' }), NOW))).toBe(false);
     w.reset();
     expect(w.observe(at('300'))).toBe(false);
+  });
+  it('does not reward a rollback recovery; only a new high-water mark earns a bonus', () => {
+    const w = new BlockWatcher();
+    expect(['100', '101', '100', '101', '99', '100', '101', '102'].map((h) => w.observe(at(h))))
+      .toEqual([false, true, false, false, false, false, false, true]);
   });
 });
 
@@ -118,6 +142,20 @@ describe('fetchStatus', () => {
     await p.poll();
     p.stop();
     expect(seen).toEqual(['ready', 'offline']);
+    expect(p.lastReading?.blockHeight).toBe('7661');
+  });
+  it('malformed time fields never replace the last validated historical reading', async () => {
+    let malformed = false;
+    const now = new Date().toISOString();
+    const p = new Poller(async () => ({ ok: true, status: 200, json: async () => sample({}, {
+      observedAt: malformed ? 'invalid' : now,
+      receivedAt: now,
+    }, { blockHeight: malformed ? '99999' : '7661' }) }), () => {}, 1_000_000);
+    await p.poll();
+    malformed = true;
+    await p.poll();
+    p.stop();
+    expect(p.latest?.state).toBe('invalid');
     expect(p.lastReading?.blockHeight).toBe('7661');
   });
 });

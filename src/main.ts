@@ -26,13 +26,10 @@ const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getEleme
 type View = 'ready' | 'running' | 'paused' | 'results';
 type PauseReason = 'user' | 'hidden' | 'stall' | 'signal' | 'transfer';
 
-const ledger = new Ledger(browserKV());
+const ledger = new Ledger(browserKV(), newId());
 const sound = new Sound();
 const watcher = new BlockWatcher();
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
-
-// Any run left active by a previous page load was abandoned: entry stays spent, no credit.
-ledger.abandonActive();
 
 const app = {
   view: 'ready' as View,
@@ -44,6 +41,7 @@ const app = {
   busy: false,
   finishHandled: false,
   lastResult: null as RunResult | null,
+  resultSaved: false,
   lastBalance: 0,
   shake: 0,
   toastTimer: 0,
@@ -127,7 +125,7 @@ function renderTelemetry(): void {
   const now = Date.now();
   const st = signalState();
   const snap = poller.latest;
-  const r = snap?.reading ?? poller.lastReading;
+  const r = st === 'ready' ? snap?.reading ?? null : poller.lastReading;
   const historical = st !== 'ready';
   let conn = 'Connecting';
   if (snap) {
@@ -234,6 +232,9 @@ function renderPanel(): void {
     }
   } else if (app.view === 'results' && app.lastResult) {
     const r = app.lastResult;
+    $('result-note').hidden = app.resultSaved;
+    $('result-note').textContent = app.resultSaved ? '' : 'This result could not be saved. No coins or personal bests were added. Start a new run to try again.';
+    $('r-earned-label').textContent = app.resultSaved ? 'Coins earned' : 'Coins not credited';
     $('results-title').textContent = r.reason === 'time' ? 'Time! Run complete' : 'Out of hearts';
     $('r-score').textContent = fmt.format(r.score);
     $('r-earned').textContent = fmt.format(r.coinsEarned);
@@ -371,11 +372,14 @@ function handleFinish(e: EngineState): void {
   const r = e.result;
   const res = ledger.finishRun(app.runId, r);
   app.lastResult = r;
+  app.resultSaved = res.ok;
   app.lastBalance = res.data.balance;
   renderWallet(res.data);
   setView('results');
   sound.play('finish');
-  announce(`Run over. Score ${fmt.format(r.score)}. ${fmt.format(r.coinsEarned)} coins earned. Balance ${fmt.format(res.data.balance)}.`);
+  announce(res.ok
+    ? `Run over. Score ${fmt.format(r.score)}. ${fmt.format(r.coinsEarned)} coins earned. Balance ${fmt.format(res.data.balance)}.`
+    : `Run over. This result could not be saved. No coins or personal bests were added. Balance ${fmt.format(res.data.balance)}.`);
   $('again-btn').focus({ preventScroll: true });
 }
 
@@ -419,7 +423,7 @@ function frame(now: number): void {
   drawScene(
     ctx,
     scale,
-    { blend: sw.blend, distance: app.engine && app.view !== 'ready' ? app.engine.distance : now * 0.03, time: reducedMotion.matches ? 0 : now / 1000, muted: sw.muted },
+    { blend: sw.blend, distance: app.engine && app.view !== 'ready' ? app.engine.distance : reducedMotion.matches ? 0 : now * 0.03, time: reducedMotion.matches ? 0 : now / 1000, muted: sw.muted },
     app.view === 'ready' ? null : app.engine,
     app.shake,
   );
@@ -431,6 +435,7 @@ function frame(now: number): void {
 // ---------- Shop ----------
 const shop = $<HTMLDialogElement>('shop');
 function openShop(message?: string): void {
+  if (app.view === 'running') pause('user');
   $('shop-note').textContent = message ?? 'Each run costs 1,000 test coins. Pick a pack to add it to this device.';
   $('shop-status').textContent = '';
   if (!shop.open) shop.showModal();
@@ -548,6 +553,11 @@ window.addEventListener('keydown', (ev) => {
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) pause('hidden');
+});
+window.addEventListener('pagehide', (event) => {
+  pause('hidden');
+  // A page in the back/forward cache is still owned and can be resumed by its player.
+  if (!event.persisted) ledger.abandonActive();
 });
 window.addEventListener('storage', () => {
   renderWallet();
